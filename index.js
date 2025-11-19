@@ -9,189 +9,209 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// ---------- IA (OpenAI) ----------
+// ---------------------
+// OPENAI (IA)
+// ---------------------
 const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY
 });
 
-// ---------- Cache simples por UF ----------
-const cacheImoveis = new Map(); // { uf: { data, timestamp } }
-const CACHE_MS = 10 * 60 * 1000; // 10 minutos
+// ---------------------
+// CACHE (10 minutos)
+// ---------------------
+const cacheImoveis = new Map(); 
+const CACHE_MS = 10 * 60 * 1000;
 
-// ---------- Helpers ----------
+// ---------------------
+// HELPERS
+// ---------------------
 function parseNumeroBr(valorStr) {
   if (!valorStr) return 0;
-  // remove espaços
   let s = String(valorStr).trim();
-  // tira qualquer símbolo de moeda
   s = s.replace(/[R$\s]/g, '');
-  // milhar com . e decimal com ,
   s = s.replace(/\./g, '').replace(',', '.');
   const n = Number(s);
   return Number.isNaN(n) ? 0 : n;
 }
 
-/**
- * Baixa o CSV direto do site da Caixa:
- * https://venda-imoveis.caixa.gov.br/listaweb/Lista_imoveis_[UF].csv
- */
+// ---------------------
+// BAIXAR CSV DA CAIXA
+// ---------------------
 async function fetchCsvCaixa(uf) {
   const ufUpper = uf.toUpperCase();
   const url = `https://venda-imoveis.caixa.gov.br/listaweb/Lista_imoveis_${ufUpper}.csv`;
 
-  const resp = await axios.get(url, {
-    responseType: 'arraybuffer' // pra não quebrar acentuação
-  });
+  console.log(`[Caixa] Baixando CSV: ${url}`);
 
-  // muitos CSVs da Caixa vêm em latin1; se der caractere estranho, troca pra 'utf-8'
-  return resp.data.toString('latin1');
+  try {
+    const resp = await axios.get(url, {
+      responseType: 'arraybuffer',
+      headers: {
+        'User-Agent':
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36',
+        'Accept': 'text/csv,*/*;q=0.8',
+        'Accept-Language': 'pt-BR,pt;q=0.9'
+      },
+      timeout: 20000
+    });
+
+    console.log('[Caixa] Status:', resp.status, 'Bytes:', resp.data.length);
+
+    return resp.data.toString('latin1');
+  } catch (err) {
+    if (err.response) {
+      console.error('[Caixa] Erro HTTP:', err.response.status);
+    } else {
+      console.error('[Caixa] Erro de rede:', err.message);
+    }
+    throw err;
+  }
 }
 
-/**
- * Converte o CSV em array de imóveis normalizados.
- * IMPORTANTE: depois que você olhar um CSV real, ajuste os nomes das colunas aqui.
- */
-function parseImoveisCsv(csvString, uf) {
-  const records = parse(csvString, {
+// ---------------------
+// PARSE DO CSV
+// ---------------------
+function parseImoveisCsv(csvStr, uf) {
+  const records = parse(csvStr, {
     columns: true,
     skip_empty_lines: true,
     delimiter: ';'
   });
 
   return records.map((row, idx) => {
-    // Ajuste os nomes conforme o cabeçalho real do CSV
-    const cidade  = row['MUNICIPIO'] || row['Município'] || row['CIDADE'] || '';
-    const bairro  = row['BAIRRO'] || row['Bairro'] || '';
-    const lograd  = row['ENDERECO'] || row['Endereço'] || row['LOGRADOURO'] || '';
-    const modalidade = row['MODALIDADE'] || row['Modalidade'] || '';
-    const tipo    = row['TIPO_IMOVEL'] || row['Tipo de Imóvel'] || row['TIPO'] || '';
-    const situacao = row['SITUACAO'] || row['Situação'] || '';
-    const valor   = parseNumeroBr(row['VALOR'] || row['Valor'] || row['VALOR_AVALIACAO'] || '');
-    const area    = parseNumeroBr(row['AREA_TOTAL'] || row['Área Total'] || row['AREA'] || '');
-
     return {
-      id: idx,        // você pode depois usar um ID do próprio CSV se tiver
-      bruto: row,     // linha completa para uso futuro
+      id: idx,
+      bruto: row,
+
       uf: row['UF'] || uf,
-      cidade,
-      bairro,
-      logradouro: lograd,
-      modalidade,
-      valor,
-      area,
-      tipo,
-      situacao,
-      // por enquanto sem geocodificação real
+      cidade: row['MUNICIPIO'] || row['CIDADE'] || '',
+      bairro: row['BAIRRO'] || '',
+      logradouro: row['ENDERECO'] || row['LOGRADOURO'] || '',
+
+      modalidade: row['MODALIDADE'] || '',
+      tipo: row['TIPO_IMOVEL'] || row['TIPO'] || '',
+      situacao: row['SITUACAO'] || '',
+
+      valor: parseNumeroBr(row['VALOR'] || row['VALOR_AVALIACAO'] || ''),
+      area: parseNumeroBr(row['AREA_TOTAL'] || row['AREA'] || ''),
+
       lat: null,
       lng: null
     };
   });
 }
 
-/**
- * Carrega imóveis de uma UF usando cache.
- */
+// ---------------------
+// CARREGAR COM CACHE
+// ---------------------
 async function getImoveisPorUf(uf) {
   const now = Date.now();
   const cached = cacheImoveis.get(uf);
 
   if (cached && now - cached.timestamp < CACHE_MS) {
+    console.log('[CACHE] Usando cache para UF', uf);
     return cached.data;
   }
 
+  console.log('[CACHE] Baixando UF', uf);
   const csv = await fetchCsvCaixa(uf);
   const imoveis = parseImoveisCsv(csv, uf);
+
   cacheImoveis.set(uf, { data: imoveis, timestamp: now });
   return imoveis;
 }
 
-// ---------- Rotas ----------
-
-// Saúde do serviço
+// ---------------------
+// ROTA: Saúde
+// ---------------------
 app.get('/', (req, res) => {
   res.send('Arremate Certo backend está no ar');
 });
 
-// Lista de imóveis reais da Caixa (por UF + filtros básicos)
+// ---------------------
+// ROTA: /api/imoveis
+// ---------------------
 app.get('/api/imoveis', async (req, res) => {
   try {
     const { uf, modalidade, minValor, maxValor } = req.query;
-    if (!uf) {
-      return res.status(400).json({ error: 'Parâmetro uf é obrigatório (ex: ?uf=SP)' });
-    }
+
+    if (!uf) return res.status(400).json({ error: 'Parâmetro uf é obrigatório' });
 
     let imoveis = await getImoveisPorUf(uf);
 
     if (modalidade) {
       imoveis = imoveis.filter(i =>
-        (i.modalidade || '').toUpperCase().includes(modalidade.toUpperCase())
+        (i.modalidade || '')
+          .toUpperCase()
+          .includes(modalidade.toUpperCase())
       );
     }
 
-    if (minValor) {
-      imoveis = imoveis.filter(i => i.valor >= Number(minValor));
-    }
-
-    if (maxValor) {
-      imoveis = imoveis.filter(i => i.valor <= Number(maxValor));
-    }
+    if (minValor) imoveis = imoveis.filter(i => i.valor >= Number(minValor));
+    if (maxValor) imoveis = imoveis.filter(i => i.valor <= Number(maxValor));
 
     res.json(imoveis);
   } catch (err) {
-    console.error('Erro /api/imoveis:', err.message);
-    res.status(500).json({ error: 'Erro ao carregar imóveis da Caixa' });
+    console.error('Erro /api/imoveis:', err);
+    const status = err.response?.status;
+    if (status) {
+      return res.status(500).json({
+        error: `Erro ao carregar imóveis da Caixa (HTTP Caixa ${status})`
+      });
+    }
+    res.status(500).json({
+      error: `Erro ao carregar imóveis da Caixa: ${err.message}`
+    });
   }
 });
 
-/**
- * Rota de análise de viabilidade com IA.
- * Recebe o objeto do imóvel (como o front recebe do /api/imoveis).
- */
+// ---------------------
+// ROTA: Análise de IA
+// ---------------------
 app.post('/api/imoveis/analise', async (req, res) => {
   try {
     const imovel = req.body || {};
 
     const prompt = `
-Você é um analista especializado em imóveis de leilão da Caixa.
+Analise este imóvel de leilão da Caixa e retorne um JSON:
 
-Analise o seguinte imóvel com foco em viabilidade de arremate (não invente dados além do que está aqui):
+Imóvel:
+- UF: ${imovel.uf}
+- Cidade: ${imovel.cidade}
+- Bairro: ${imovel.bairro}
+- Tipo: ${imovel.tipo}
+- Modalidade: ${imovel.modalidade}
+- Valor: ${imovel.valor}
+- Área: ${imovel.area}
+- Situação: ${imovel.situacao}
 
-Dados:
-- UF: ${imovel.uf || ''}
-- Cidade: ${imovel.cidade || ''}
-- Bairro: ${imovel.bairro || ''}
-- Tipo: ${imovel.tipo || ''}
-- Modalidade: ${imovel.modalidade || ''}
-- Valor: R$ ${imovel.valor || ''}
-- Área: ${imovel.area || ''} m²
-- Situação: ${imovel.situacao || ''}
-
-Responda em JSON com os campos:
-- "score": número de 0 a 100 (quanto maior, maior a atratividade do arremate)
-- "resumo": texto curto (2 ou 3 frases) explicando o perfil do imóvel
-- "pontos_positivos": array de textos curtos
-- "pontos_atencao": array de textos curtos
-- "estrategia": texto com uma recomendação prática para o investidor.
-
-Use apenas critérios genéricos baseados nessas informações: tipo, modalidade, valor relativo (mesmo sem média de mercado), ocupação/situação e localização.
+Responda APENAS em JSON com:
+{
+  "score": (0-100),
+  "resumo": "",
+  "pontos_positivos": [],
+  "pontos_atencao": [],
+  "estrategia": ""
+}
 `;
 
     const completion = await openai.responses.create({
-      model: 'gpt-4.1-mini',
+      model: "gpt-4.1-mini",
       input: prompt,
-      response_format: { type: 'json_object' }
+      response_format: { type: "json_object" }
     });
 
     const txt = completion.output[0].content[0].text;
     const json = JSON.parse(txt);
+
     res.json(json);
   } catch (err) {
-    console.error('Erro /api/imoveis/analise:', err.message);
+    console.error('Erro /api/imoveis/analise:', err);
     res.status(500).json({ error: 'Erro ao gerar análise de IA' });
   }
 });
 
 const PORT = process.env.PORT || 4000;
 app.listen(PORT, () => {
-  console.log(`Servidor Arremate Certo rodando na porta ${PORT}`);
+  console.log(`Servidor rodando na porta ${PORT}`);
 });
